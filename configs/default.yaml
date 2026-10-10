@@ -1,0 +1,72 @@
+# dfwalk 默认配置。任何字段都可以在命令行用 --set section.key=value 覆盖，
+# 例如：dfwalk train --set train.epochs=5 --set train.batch_size=4
+
+data:
+  root: data                 # 数据根目录，见 README 的目录约定
+  image_size: [384, 672]     # 训练/推理输入尺寸 [高, 宽]，都必须是 32 的倍数
+  val_ratio: 0.2             # split 时验证集占比（按视频分组划分，避免同一段录像同时出现在训练和验证集）
+  seed: 42
+
+# HUD（小地图、血条、弹药数、准星、击杀提示等）区域在标注和训练中一律视为“忽略”。
+# 坐标为归一化矩形 [x0, y0, x1, y1]，取值 0~1，左上角为原点。
+# 不同分辨率/UI 缩放下位置不同，请先用 `dfwalk hud-preview` 在自己的截图上核对后再填写。
+hud:
+  rects: []
+  # 示例（仅示意，必须按自己的画面调整）：
+  # rects:
+  #   - [0.00, 0.00, 0.20, 0.30]   # 左上角小地图
+  #   - [0.80, 0.85, 1.00, 1.00]   # 右下角弹药
+  #   - [0.48, 0.47, 0.52, 0.53]   # 准星
+
+frames:
+  fps: 2.0                   # 每秒抽取帧数
+  max_side: 1280             # 抽帧后最长边缩放到该值（0 表示不缩放）
+  dedup_threshold: 6.0       # 与上一张保留帧的平均灰度差（0~255）低于该值则视为重复帧丢弃；0 关闭去重
+  jpeg_quality: 95
+
+autolabel:
+  model: nvidia/segformer-b2-finetuned-ade-512-512
+  short_side: 512            # 推理时短边缩放到该值（保持宽高比）
+  hi_threshold: 0.7          # 可走概率 >= hi 标为可走
+  lo_threshold: 0.3          # 可走概率 <= lo 标为不可走；介于两者之间标为忽略(255)
+  device: auto
+  # ADE20K 中被视为“可走地面”的类别名（大小写/首尾空格不敏感）。
+  walkable_labels:
+    - floor
+    - road
+    - grass
+    - sidewalk
+    - earth
+    - rug
+    - field
+    - sand
+    - path
+    - stairs
+    - runway
+    - stairway
+    - bridge
+    - dirt track
+    - land
+    - step
+
+train:
+  arch: Unet                 # segmentation_models_pytorch 架构名：Unet / UnetPlusPlus / FPN / DeepLabV3Plus / Segformer ...
+  encoder: resnet34
+  encoder_weights: imagenet  # null 表示随机初始化（离线环境/单元测试用）
+  epochs: 50
+  batch_size: 8
+  lr: 0.0003
+  weight_decay: 0.0001
+  num_workers: 4
+  ce_weight: 1.0
+  dice_weight: 1.0
+  amp: true                  # 仅在 CUDA 上生效
+  out_dir: runs/exp
+  device: auto
+  seed: 42
+
+infer:
+  threshold: 0.5             # 可走概率阈值
+  alpha: 0.45                # 叠加图透明度
+  color: [0, 255, 0]         # 可走区域叠加颜色（RGB）
+  device: auto

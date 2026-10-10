@@ -1,0 +1,36 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "dfwalk"
+version = "0.1.0"
+description = "《三角洲行动》第一人称画面可走区域语义分割（离线分析工具）"
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "MIT" }
+dependencies = [
+    "torch>=2.1",
+    "torchvision>=0.16",
+    "segmentation-models-pytorch>=0.3.3",
+    "numpy>=1.24",
+    "opencv-python-headless>=4.8",
+    "pillow>=10.0",
+    "pyyaml>=6.0",
+    "tqdm>=4.65",
+]
+
+[project.optional-dependencies]
+autolabel = ["transformers>=4.40"]
+onnx = ["onnx>=1.15"]
+dev = ["pytest>=7.4", "transformers>=4.40", "onnx>=1.15"]
+
+[project.scripts]
+dfwalk = "dfwalk.cli:main"
+
+[tool.setuptools.packages.find]
+include = ["dfwalk*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q"
