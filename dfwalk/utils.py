@@ -1,11 +1,13 @@
-"""公共小工具：设备选择、随机种子、图像/掩码读写。
+"""公共小工具：设备选择、随机种子、图像/掩码读写、打开视频。
 
 图像读写统一走 np.fromfile + cv2.imdecode / cv2.imencode + tofile，
 避免 Windows 下中文路径导致 cv2.imread 返回 None。
+视频只能交给 cv2.VideoCapture 按路径打开：Windows 下打不开中文路径时改用 8.3 短路径重试（open_video）。
 """
 
 from __future__ import annotations
 
+import os
 import random
 from pathlib import Path
 
@@ -67,7 +69,11 @@ def write_image_rgb(path: str | Path, image: np.ndarray, jpeg_quality: int = 95)
 
 
 def read_mask(path: str | Path) -> np.ndarray:
-    """读取单通道 uint8 掩码 PNG（值域 {0, 1, 255}）。"""
+    """读取单通道 uint8 掩码 PNG（值域 {0, 1, 255}）。
+
+    不是单通道、或不是 8 位（例如 16 位 PNG：直接转 uint8 会把 256 变成 0、257 变成 1，
+    后续的值域检查也发现不了）时抛 ValueError。
+    """
     path = Path(path)
     if not path.is_file():
         raise FileNotFoundError(path)
@@ -77,7 +83,9 @@ def read_mask(path: str | Path) -> np.ndarray:
         raise ValueError(f"无法解码掩码: {path}")
     if mask.ndim != 2:
         raise ValueError(f"掩码必须是单通道 PNG: {path}, shape={mask.shape}")
-    return mask.astype(np.uint8, copy=False)
+    if mask.dtype != np.uint8:
+        raise ValueError(f"掩码必须是 8 位单通道 PNG（uint8），得到 dtype={mask.dtype}: {path}")
+    return mask
 
 
 def write_mask(path: str | Path, mask: np.ndarray) -> None:
@@ -92,3 +100,57 @@ def write_mask(path: str | Path, mask: np.ndarray) -> None:
     if not ok:
         raise ValueError(f"无法编码掩码: {path}")
     enc.tofile(str(path))
+
+
+def bgr_to_rgb(frame: np.ndarray) -> np.ndarray:
+    """cv2.VideoCapture 读出的帧（BGR，个别后端给出灰度或 BGRA）→ HxWx3 uint8 RGB。"""
+    if frame.ndim == 2:
+        return cv2.cvtColor(frame, cv2.COLOR_GRAY2RGB)
+    if frame.shape[2] == 4:
+        return cv2.cvtColor(frame, cv2.COLOR_BGRA2RGB)
+    return cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+
+
+def _windows_short_path(path: Path) -> str | None:  # pragma: no cover - 仅 Windows
+    """Windows 下取 8.3 短路径（纯 ASCII），给不支持中文路径的视频后端兜底。取不到时返回 None。"""
+    if os.name != "nt":
+        return None
+    try:
+        import ctypes
+        from ctypes import wintypes
+
+        fn = ctypes.windll.kernel32.GetShortPathNameW
+        fn.argtypes = [wintypes.LPCWSTR, wintypes.LPWSTR, wintypes.DWORD]
+        fn.restype = wintypes.DWORD
+        need = fn(str(path), None, 0)
+        if need == 0:
+            return None
+        buf = ctypes.create_unicode_buffer(need)
+        if fn(str(path), buf, need) == 0:
+            return None
+        short = buf.value
+        return short if short and short != str(path) and short.isascii() else None
+    except Exception:
+        return None
+
+
+def open_video(path: str | Path) -> cv2.VideoCapture:
+    """用 cv2.VideoCapture 打开本地视频文件，失败时抛 ValueError（信息中包含路径）。
+
+    文件不存在也抛 ValueError（与“格式不支持/文件损坏”统一处理，调用方只需捕获一种异常）。
+    Windows 下第一次打开失败时用 8.3 短路径重试一次（部分视频后端不支持中文路径）。
+    调用方负责 release()。
+    """
+    path = Path(path)
+    if not path.is_file():
+        raise ValueError(f"无法打开视频（文件不存在）: {path}")
+    cap = cv2.VideoCapture(str(path))
+    if not cap.isOpened():
+        cap.release()
+        short = _windows_short_path(path)
+        if short is not None:  # pragma: no cover - 仅 Windows
+            cap = cv2.VideoCapture(short)
+    if not cap.isOpened():
+        cap.release()
+        raise ValueError(f"无法打开视频（格式不支持或文件损坏）: {path}")
+    return cap

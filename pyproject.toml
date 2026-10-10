@@ -10,9 +10,9 @@ readme = "README.md"
 requires-python = ">=3.10"
 license = { text = "MIT" }
 dependencies = [
-    "torch>=2.1",
-    "torchvision>=0.16",
-    "segmentation-models-pytorch>=0.3.3",
+    "torch>=2.3",              # torch.amp.GradScaler("cuda")
+    "torchvision>=0.18",
+    "segmentation-models-pytorch>=0.4",  # MODEL_ARCHITECTURES_MAPPING、Segformer 等架构
     "numpy>=1.24",
     "opencv-python-headless>=4.8",
     "pillow>=10.0",
@@ -22,8 +22,16 @@ dependencies = [
 
 [project.optional-dependencies]
 autolabel = ["transformers>=4.40"]
-onnx = ["onnx>=1.15"]
-dev = ["pytest>=7.4", "transformers>=4.40", "onnx>=1.15"]
+# onnx：新版 torch 的导出器本身需要它；onnxscript：legacy 导出器不可用时的 dynamo 导出器后备；
+# onnxruntime：在本机校验/部署导出的模型（README 中的示例）
+onnx = ["onnx>=1.15", "onnxscript>=0.1", "onnxruntime>=1.17"]
+dev = [
+    "pytest>=7.4",
+    "transformers>=4.40",
+    "onnx>=1.15",
+    "onnxscript>=0.1",
+    "onnxruntime>=1.17",
+]
 
 [project.scripts]
 dfwalk = "dfwalk.cli:main"
