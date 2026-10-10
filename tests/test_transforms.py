@@ -166,6 +166,19 @@ def test_eval_transform_interpolation_rules():
     torch.testing.assert_close(t_img, to_tensor_normalized(ref))
 
 
+def test_eval_transform_area_for_non_integer_downscale():
+    """真实缩放比例不是整数（1080p → 384x672 约 2.8 倍）。恰好 2 倍时 INTER_LINEAR 与 INTER_AREA 结果相同，
+    区分不了两者，所以这里用 1.5625 倍：必须是 INTER_AREA（抗锯齿）的结果。"""
+    img = random_image(100, 150, seed=8)
+    area = cv2.resize(img, (TARGET[1], TARGET[0]), interpolation=cv2.INTER_AREA)
+    linear = cv2.resize(img, (TARGET[1], TARGET[0]), interpolation=cv2.INTER_LINEAR)
+    assert np.abs(area.astype(int) - linear.astype(int)).max() > 20  # 本用例确实能区分两种插值
+    t_img, _ = EvalTransform(TARGET)(img)
+    torch.testing.assert_close(t_img, to_tensor_normalized(area))
+    t_img, _ = TrainTransform(TARGET, scale=(1.0, 1.0), hflip_p=0.0, jitter=0.0, hue=0.0, blur_p=0.0)(img)
+    torch.testing.assert_close(t_img, to_tensor_normalized(area))
+
+
 def test_eval_transform_mask_nearest_upscale_and_downscale():
     mask = random_mask(32, 48, seed=2)
     _, up = EvalTransform(TARGET)(random_image(32, 48), mask)

@@ -169,6 +169,35 @@ def test_onnx_matches_predictor_with_checkpoint_normalization(ckpt, dynamic_onnx
     np.testing.assert_allclose(prob, expected, atol=1e-4)
 
 
+def _readme_onnx_snippet() -> str:
+    """README “部署 ONNX 模型” 一节中的 onnxruntime 示例代码。"""
+    readme = (Path(__file__).resolve().parents[1] / "README.md").read_text(encoding="utf-8")
+    section = readme.split("## 部署 ONNX 模型", 1)[1]
+    return section.split("```python", 1)[1].split("```", 1)[0]
+
+
+@pytest.mark.parametrize("src_hw", [(128, 192), (48, 80), (80, 60), (40, 128)])
+def test_readme_onnx_snippet_matches_predictor(ckpt, dynamic_onnx, tmp_path, monkeypatch, src_hw):
+    """照抄 README 示例的用户应得到与 dfwalk infer 相同的概率：包括截图比模型输入小（需要放大）的情况，
+    此时必须像 EvalTransform 一样用 INTER_LINEAR，而不是总用 INTER_AREA。"""
+    pytest.importorskip("onnxruntime")
+    import shutil
+
+    from dfwalk.utils import read_image_rgb, write_image_rgb
+
+    work = tmp_path / "work"
+    (work / "runs" / "exp").mkdir(parents=True)
+    shutil.copy(dynamic_onnx, work / "runs" / "exp" / "model.onnx")
+    rng = np.random.default_rng(sum(src_hw))
+    write_image_rgb(work / "shot.jpg", rng.integers(0, 256, size=(*src_hw, 3), dtype=np.uint8))
+    monkeypatch.chdir(work)
+    namespace: dict = {}
+    exec(compile(_readme_onnx_snippet(), "README.md", "exec"), namespace)
+    expected = Predictor.from_checkpoint(ckpt, device="cpu").predict_prob(read_image_rgb(work / "shot.jpg"))
+    assert namespace["prob"].shape == src_hw
+    np.testing.assert_allclose(namespace["prob"], expected, atol=1e-4)
+
+
 # ---------------------------------------------------------------- 路径与覆盖
 
 
@@ -244,6 +273,35 @@ def test_without_onnx_skips_postprocessing(ckpt, tmp_path, monkeypatch):
     model = onnx.load(str(out))
     assert [i.name for i in model.graph.input] == ["image"]
     assert "dfwalk.image_size" not in metadata_of(model)
+
+
+def test_warns_when_fallback_exporter_ignores_requested_opset(ckpt, tmp_path, monkeypatch):
+    """torch.export（dynamo）导出器降不到要求的 opset 时会保留 18（例如 UPerNet 在默认尺寸下）：
+    不能悄悄写出与 --opset 不同的文件，要发出写明实际 opset 的警告。"""
+    real_legacy = export_mod._export_legacy
+
+    def legacy_fails(*args, **kwargs):
+        raise RuntimeError("adaptive_avg_pool2d output size not a factor of input size")
+
+    def dynamo_keeps_18(model, dummy, path, opset, dynamic_batch):
+        real_legacy(model, dummy, path, 18, dynamic_batch)
+
+    monkeypatch.setattr(export_mod, "_export_legacy", legacy_fails)
+    monkeypatch.setattr(export_mod, "_dynamo_available", lambda: True)
+    monkeypatch.setattr(export_mod, "_export_dynamo", dynamo_keeps_18)
+    out = tmp_path / "m.onnx"
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        export_onnx(ckpt, out, opset=13)
+    messages = [str(w.message) for w in caught if issubclass(w.category, UserWarning)]
+    assert any("opset 为 18" in m and "13" in m for m in messages), messages
+    assert opset_of(onnx.load(str(out))) == 18
+    assert export_mod.onnx_opset(out) == 18
+
+
+def test_onnx_opset_reads_file(dynamic_onnx, static_onnx):
+    assert export_mod.onnx_opset(dynamic_onnx) == 17
+    assert export_mod.onnx_opset(static_onnx) == 13
 
 
 def test_fallback_to_dynamo_exporter(ckpt, tmp_path, monkeypatch):

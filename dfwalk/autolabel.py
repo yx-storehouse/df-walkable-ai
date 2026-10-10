@@ -21,7 +21,8 @@ import numpy as np
 from . import IGNORE_INDEX, IMAGENET_MEAN, IMAGENET_STD, NON_WALKABLE, WALKABLE, hud
 from .utils import list_images, read_image_rgb, resolve_device, write_mask
 
-_INSTALL_HINT = 'pip install "dfwalk[autolabel]"（或 pip install transformers）'
+# dfwalk 没有发布到 PyPI：只能在仓库目录中以可编辑方式安装可选依赖（与 README、CLI 帮助一致）
+_INSTALL_HINT = 'pip install -e ".[autolabel]"（在仓库目录中执行）或 pip install transformers'
 
 
 def normalize_label(name: str) -> str:
@@ -224,7 +225,8 @@ class AutoLabeler:
         device: str = "auto",
     ) -> "AutoLabeler":
         """从 Hugging Face 加载 SegformerForSemanticSegmentation 及其 image processor 的 mean/std。
-        transformers 延迟导入；未安装时抛 ImportError，提示 pip install "dfwalk[autolabel]"。
+        transformers 延迟导入；未安装时抛 ImportError，提示在仓库目录中 pip install -e ".[autolabel]"
+        （或 pip install transformers）。
         device 经 dfwalk.utils.resolve_device 解析；模型 eval() 并移到该设备。
 
         name 可以是 Hub 上的模型名（如 nvidia/segformer-b2-finetuned-ade-512-512），也可以是

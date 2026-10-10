@@ -101,10 +101,27 @@ def _export_dynamo(model, dummy, path: Path, opset: int, dynamic_batch: bool) ->
     torch.onnx.export(model, (dummy,), str(path), **kwargs)
 
 
+def _default_opset(model) -> int | None:
+    """onnx.ModelProto 默认域（"" / "ai.onnx"）的 opset 版本；没有声明时返回 None。"""
+    for entry in model.opset_import:
+        if entry.domain in ("", "ai.onnx"):
+            return int(entry.version)
+    return None
+
+
+def onnx_opset(path: str | Path) -> int | None:
+    """读取 ONNX 文件实际的 opset 版本（默认域）；没有安装 onnx 包或文件中没有声明时返回 None。"""
+    if not _onnx_available():
+        return None
+    import onnx
+
+    return _default_opset(onnx.load(str(path), load_external_data=False))
+
+
 def _finalize(path: Path, in_shape: tuple[int, ...], out_shape: tuple[int, ...], dynamic_batch: bool,
-              metadata: dict[str, str]) -> None:
+              metadata: dict[str, str]) -> int | None:
     """改写输入/输出形状声明（dynamic_batch 时第 0 维写成符号 "batch"）、写入 metadata，
-    并运行 onnx.checker（需要 onnx）。"""
+    并运行 onnx.checker（需要 onnx）。返回文件实际的 opset 版本（默认域）。"""
     import onnx
 
     model = onnx.load(str(path))
@@ -136,6 +153,7 @@ def _finalize(path: Path, in_shape: tuple[int, ...], out_shape: tuple[int, ...],
 
     onnx.save(model, str(path))
     onnx.checker.check_model(str(path))
+    return _default_opset(model)
 
 
 def export_onnx(checkpoint_path: str | Path, out_path: str | Path, opset: int = 17,
@@ -153,6 +171,8 @@ def export_onnx(checkpoint_path: str | Path, out_path: str | Path, opset: int = 
       "dfwalk.arch"、"dfwalk.encoder"、"dfwalk.num_classes"、"dfwalk.class_names"、"dfwalk.version"
       （值为 JSON 字符串），并按真实形状改写输入/输出形状声明（见模块说明）。
     - 先写入同目录临时文件，全部成功后再改名为 out_path；失败时不留下半成品。自动创建父目录。
+    - 文件实际的 opset 与要求的不同（dynamo 导出器无法降到要求的 opset，只能给出 18）时发出 UserWarning，
+      写明实际 opset；需要时可用 onnx_opset(out_path) 读取。
     - checkpoint 不存在抛 FileNotFoundError，不是 dfwalk checkpoint 抛 ValueError；
       opset 不是正整数抛 ValueError；导出需要 onnx 包而未安装时抛 ImportError；导出失败抛 RuntimeError。
     """
@@ -192,6 +212,7 @@ def export_onnx(checkpoint_path: str | Path, out_path: str | Path, opset: int = 
     out_path.parent.mkdir(parents=True, exist_ok=True)
     tmp = out_path.with_name(out_path.name + ".tmp")
     have_onnx = _onnx_available()
+    actual_opset: int | None = None
     try:
         try:
             _export_legacy(model, dummy, tmp, opset, dynamic_batch)
@@ -217,8 +238,17 @@ def export_onnx(checkpoint_path: str | Path, out_path: str | Path, opset: int = 
                     f"dynamo 导出器 {type(dynamo_err).__name__}: {dynamo_err}"
                 ) from dynamo_err
         if have_onnx:
-            _finalize(tmp, (1, 3, h, w), out_shape, dynamic_batch, metadata)
+            actual_opset = _finalize(tmp, (1, 3, h, w), out_shape, dynamic_batch, metadata)
         tmp.replace(out_path)
     finally:
         tmp.unlink(missing_ok=True)
+    if actual_opset is not None and actual_opset != opset:
+        # torch.export（dynamo）导出器只能生成 opset >= 18，降级失败时会保留 18（例如 UPerNet 在默认尺寸下总是走到这里）
+        warnings.warn(
+            f"导出的 ONNX 模型实际 opset 为 {actual_opset}，不是要求的 {opset}："
+            f"改用的 torch.export（dynamo）导出器无法把模型转换到 opset {opset}。"
+            f"只支持 opset {opset} 及以下的推理引擎（例如较旧的 TensorRT）可能无法加载它；"
+            "必须使用该 opset 时，请换用 Unet / FPN 等 TorchScript 导出器能处理的结构",
+            stacklevel=2,
+        )
     return out_path

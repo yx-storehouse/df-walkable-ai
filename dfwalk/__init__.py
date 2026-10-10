@@ -21,4 +21,5 @@ IMAGENET_MEAN = (0.485, 0.456, 0.406)
 IMAGENET_STD = (0.229, 0.224, 0.225)
 
 IMAGE_EXTS = (".jpg", ".jpeg", ".png", ".bmp", ".webp")
-VIDEO_EXTS = (".mp4", ".mkv", ".avi", ".mov", ".flv", ".webm")
+# 包含 OBS 可选的 .ts、播放器/相机常见的 .m4v / .m2ts / .mts / .wmv（infer 按后缀区分图片与视频）
+VIDEO_EXTS = (".mp4", ".mkv", ".avi", ".mov", ".flv", ".webm", ".ts", ".m2ts", ".mts", ".m4v", ".wmv")

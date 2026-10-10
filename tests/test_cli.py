@@ -544,7 +544,8 @@ def test_autolabel_with_fake_model(capsys, tmp_path, fake_pretrained):
     stems = make_dataset(root, with_masks=False)
     args = ["autolabel", "--model", "my/fake-model", "--device", "cpu",
             "--set", f"data.root={root}", "--set", "autolabel.short_side=64",
-            "--set", "autolabel.hi_threshold=0.8", "--set", "hud.rects=[[0.75, 0.0, 1.0, 0.25]]"]
+            "--set", "autolabel.hi_threshold=0.8", "--set", "hud.rects=[[0.75, 0.0, 1.0, 0.25]]",
+            "--set", "autolabel.walkable_labels=[floor, road]"]
     code, out, _ = run(capsys, *args)
     assert code == 0
     call = fake_pretrained[0]
@@ -552,7 +553,8 @@ def test_autolabel_with_fake_model(capsys, tmp_path, fake_pretrained):
     assert call["device"] == "cpu"
     assert call["short_side"] == 64
     assert call["hi"] == 0.8 and call["lo"] == 0.3
-    assert call["walkable_labels"] == Config().autolabel.walkable_labels
+    # 配置里的可走类别要原样传给标注器（README 让用户靠增删它来修正伪标签），而不是内置默认值
+    assert call["walkable_labels"] == ["floor", "road"]
 
     out_dir = root / "pseudo_masks"
     assert sorted(p.stem for p in out_dir.glob("*.png")) == stems
@@ -579,6 +581,7 @@ def test_autolabel_custom_dirs(capsys, tmp_path, fake_pretrained):
     assert (out_dir / "a.png").is_file()
     assert fake_pretrained[0]["name"] == Config().autolabel.model
     assert fake_pretrained[0]["device"] == "auto"
+    assert fake_pretrained[0]["walkable_labels"] == Config().autolabel.walkable_labels
 
 
 def test_autolabel_errors(capsys, tmp_path, monkeypatch, fake_pretrained):
@@ -602,7 +605,7 @@ def test_autolabel_errors(capsys, tmp_path, monkeypatch, fake_pretrained):
     assert code == 1 and "HF_ENDPOINT=https://hf-mirror.com" in err
 
     def no_transformers(cls, *a, **k):
-        raise ImportError('自动标注需要 transformers，请先安装：pip install "dfwalk[autolabel]"')
+        raise ImportError('自动标注需要 transformers，请先安装：pip install -e ".[autolabel]"')
 
     monkeypatch.setattr(AutoLabeler, "from_pretrained", classmethod(no_transformers))
     code, _, err = run(capsys, "autolabel", "--set", f"data.root={root}")
@@ -667,6 +670,41 @@ def test_to_labelme_never_overwrites_without_flag(capsys, tmp_path):
     code, out, _ = run(capsys, "to-labelme", "--overwrite", "--set", f"data.root={root}")
     assert code == 0 and f"写出 {len(stems)} 个" in out
     assert json.loads(target.read_text(encoding="utf-8"))["shapes"] != []
+
+
+def test_to_labelme_hint_command_is_valid_for_current_labelme(capsys, tmp_path):
+    """下一步提示里的 labelme 命令：不能带 LabelMe 7.x 已删除的 --nodata / --autosave（会直接报错退出），
+    data.root 含空格时路径要加引号，复制到终端后参数不会被拆开。"""
+    import os
+    import shlex
+
+    root = tmp_path / "my data"
+    make_dataset(root, masks_subdir="pseudo_masks")
+    code, _, err = run(capsys, "to-labelme", "--set", f"data.root={root}")
+    assert code == 0
+    line = next(s.strip() for s in err.splitlines() if s.strip().startswith("labelme "))
+    assert "--nodata" not in line and "--autosave" not in line
+    if os.name != "nt":
+        assert shlex.split(line) == ["labelme", (root / "images").as_posix(), "--output",
+                                     (root / "labelme").as_posix(), "--labels", "walkable,non_walkable,ignore"]
+
+
+def test_quote_arg_for_both_shells():
+    import shlex
+
+    assert cli._quote_arg("data/images", windows=True) == "data/images"
+    assert cli._quote_arg("D:/我的 数据/images", windows=True) == '"D:/我的 数据/images"'
+    assert cli._quote_arg("data/images", windows=False) == "data/images"
+    assert shlex.split(cli._quote_arg("/tmp/my data/images", windows=False)) == ["/tmp/my data/images"]
+
+
+def test_readme_labelme_command_has_no_removed_flags():
+    readme = (Path(__file__).resolve().parents[1] / "README.md").read_text(encoding="utf-8")
+    commands = [line for line in readme.splitlines() if line.startswith("labelme ")]
+    assert commands
+    for cmd in commands:
+        assert "--nodata" not in cmd and "--autosave" not in cmd, cmd
+    assert 'pipx install "labelme>=6"' in readme
 
 
 def test_to_labelme_passes_flags_and_default_paths(capsys, tmp_path, monkeypatch):
@@ -873,6 +911,26 @@ def test_check_data_hard_errors(capsys, tmp_path, problem):
     assert "发现" in out
 
 
+def test_check_data_notes_video_shared_between_train_and_val(capsys, tmp_path):
+    """手工编辑的划分把同一段视频的不同帧放在 train 和 val 两边：不是错误，但必须提示（验证指标会偏乐观）。"""
+    root = tmp_path / "data"
+    make_dataset(root)
+    (root / "splits").mkdir()
+    (root / "splits" / "train.txt").write_text("base_000000\ndam_000000\ndam_000010\n", encoding="utf-8")
+    (root / "splits" / "val.txt").write_text("base_000010\nvalley_000000\n", encoding="utf-8")
+    code, out, _ = run(capsys, "check-data", "--set", f"data.root={root}")
+    assert code == 0, out
+    notes = [line for line in out.splitlines() if "同时出现在 train 和 val" in line]
+    assert len(notes) == 1
+    assert "1 段视频" in notes[0] and "base" in notes[0]
+    assert "dam" not in notes[0] and "valley" not in notes[0]
+
+    # 按视频分组的正常划分不会出现该提示
+    run(capsys, "split", "--force", "--set", f"data.root={root}")
+    code, out, _ = run(capsys, "check-data", "--set", f"data.root={root}")
+    assert code == 0 and "同时出现在 train 和 val" not in out
+
+
 def test_check_data_bad_args(capsys, tmp_path):
     root = tmp_path / "data"
     code, _, err = run(capsys, "check-data", "--set", f"data.root={root}")
@@ -969,6 +1027,33 @@ def test_train_flag_precedence(capsys, tmp_path, monkeypatch):
     assert (t.epochs, t.batch_size, t.out_dir, t.device) == (2, 1, str(tmp_path / "o"), "cpu")
 
 
+def test_train_refuses_to_overwrite_previous_run(capsys, tmp_path, monkeypatch):
+    """重新训练会在第 1 个 epoch 后替换 best.pt：输出目录已有 best.pt / last.pt 时默认拒绝（与 split 一致），
+    提示换 --out-dir 或加 --force。"""
+    import dfwalk.train
+
+    calls = []
+    monkeypatch.setattr(dfwalk.train, "train", lambda cfg: calls.append(cfg) or Path(cfg.train.out_dir) / "best.pt")
+    out_dir = tmp_path / "runs" / "exp"
+    out_dir.mkdir(parents=True)
+    (out_dir / "best.pt").write_bytes(b"v1 model")
+    code, _, err = run(capsys, "train", "--out-dir", out_dir)
+    assert code == 1
+    assert "best.pt" in err and "--out-dir" in err and "--force" in err
+    assert calls == []
+    assert (out_dir / "best.pt").read_bytes() == b"v1 model"
+
+    (out_dir / "best.pt").unlink()
+    (out_dir / "last.pt").write_bytes(b"interrupted run")  # 只有 last.pt（上次训练中断）同样拒绝
+    code, _, err = run(capsys, "train", "--out-dir", out_dir)
+    assert code == 1 and "last.pt" in err and calls == []
+
+    assert run(capsys, "train", "--out-dir", out_dir, "--force")[0] == 0
+    assert len(calls) == 1
+    assert run(capsys, "train", "--out-dir", tmp_path / "runs" / "exp2")[0] == 0  # 新目录不受影响
+    assert len(calls) == 2
+
+
 def test_train_errors(capsys, tmp_path):
     root = tmp_path / "data"
     make_dataset(root)
@@ -1005,6 +1090,30 @@ METRIC_KEYS_SET = {"iou_walkable", "iou_non_walkable", "miou", "pixel_acc", "pre
                    "recall_walkable", "f1_walkable", "loss"}
 
 
+def test_eval_split_selects_the_evaluated_frames(capsys, trained, monkeypatch):
+    """--split 不只是表头：指标必须真的在该划分上计算（表头的帧数来自另一处 read_split）。"""
+    import dfwalk.train
+
+    real = dfwalk.train.evaluate_checkpoint
+    splits = []
+
+    def spy(cfg, ckpt_path, split="val"):
+        splits.append(split)
+        return real(cfg, ckpt_path, split=split)
+
+    monkeypatch.setattr(dfwalk.train, "evaluate_checkpoint", spy)
+    assert run(capsys, "eval", "-c", trained.cfg, "--ckpt", trained.ckpt, "--device", "cpu")[0] == 0
+    code, out, _ = run(capsys, "eval", "-c", trained.cfg, "--ckpt", trained.ckpt, "--device", "cpu",
+                       "--split", "train")
+    assert code == 0
+    assert splits == ["val", "train"]
+    cfg = cli.load_cli_config(trained.cfg, ["train.device=cpu"], notice=False)
+    expected = real(cfg, trained.ckpt, split="train")
+    printed = {line.split()[0]: line.split()[1] for line in out.splitlines()
+               if line.split() and line.split()[0] in METRIC_KEYS_SET}
+    assert printed["loss"] == f"{expected['loss']:.4f}"
+
+
 def test_eval_errors(capsys, trained, tmp_path):
     code, _, err = run(capsys, "eval", "-c", trained.cfg, "--ckpt", tmp_path / "nope.pt")
     assert code == 1 and "checkpoint 不存在" in err
@@ -1014,6 +1123,36 @@ def test_eval_errors(capsys, trained, tmp_path):
     torch.save({"hello": torch.zeros(1)}, not_ckpt)
     code, _, err = run(capsys, "eval", "-c", trained.cfg, "--ckpt", not_ckpt)
     assert code == 1 and "不是 dfwalk checkpoint" in err
+
+
+@pytest.mark.parametrize("name", ["model.onnx", "config.yaml", "history.csv", "shot.jpg"])
+def test_non_checkpoint_ckpt_is_a_clean_error(capsys, trained, tmp_path, name):
+    """误把导出的 model.onnx、配置、图片等传给 --ckpt：打印 “错误: 不是 dfwalk checkpoint …”，
+    而不是 UnpicklingError 堆栈和“改用 weights_only=False”的误导建议。"""
+    path = tmp_path / name
+    if name == "model.onnx":
+        onnx = pytest.importorskip("onnx")
+        from onnx import TensorProto, helper
+
+        graph = helper.make_graph([helper.make_node("Identity", ["x"], ["y"])], "g",
+                                  [helper.make_tensor_value_info("x", TensorProto.FLOAT, [1])],
+                                  [helper.make_tensor_value_info("y", TensorProto.FLOAT, [1])])
+        onnx.save(helper.make_model(graph), str(path))
+    elif name == "config.yaml":
+        path.write_bytes(trained.cfg.read_bytes())
+    elif name == "history.csv":
+        path.write_bytes((trained.out_dir / "history.csv").read_bytes())
+    else:
+        write_image_rgb(path, make_image(3))
+    img = tmp_path / "a.jpg"
+    write_image_rgb(img, make_image(4))
+    for argv in (["infer", "--ckpt", path, img, "-o", tmp_path / "out"], ["eval", "--ckpt", path],
+                 ["export-onnx", "--ckpt", path, "-o", tmp_path / "m.onnx"]):
+        code, _, err = run(capsys, *argv, "-c", trained.cfg)
+        assert code == 1, argv
+        assert "错误: 不是 dfwalk checkpoint" in err and "Traceback" not in err and "weights_only" not in err
+        if name == "model.onnx":
+            assert "onnxruntime" in err
 
 
 def test_format_metrics_table():
@@ -1080,6 +1219,63 @@ def test_infer_video_and_directory(capsys, trained, tmp_path):
     assert f"视频: {video} → {out_video}" in out
 
 
+def test_infer_video_receives_cli_and_config_settings(capsys, trained, tmp_path, monkeypatch):
+    """视频推理要用上 --threshold / --every-n / --max-frames 以及配置中的 hud.rects、infer.alpha、infer.color
+    （图片路径有内容检查，视频路径之前只检查了帧数和分辨率）。"""
+    import inspect
+
+    import dfwalk.infer
+
+    real = dfwalk.infer.infer_video
+    calls = []
+
+    def spy(*args, **kwargs):
+        bound = inspect.signature(real).bind(*args, **kwargs)
+        bound.apply_defaults()
+        calls.append(dict(bound.arguments))
+        return real(*args, **kwargs)
+
+    monkeypatch.setattr(dfwalk.infer, "infer_video", spy)
+    video = make_video(tmp_path / "media" / "clip", [make_image(80 + i) for i in range(6)], fps=10.0)
+    out_dir = tmp_path / "out"
+    code, _, err = run(capsys, "infer", "-c", trained.cfg, "--ckpt", trained.ckpt, video, "-o", out_dir,
+                       "--threshold", "0.7", "--every-n", "3", "--max-frames", "4",
+                       "--set", "hud.rects=[[0.75, 0.0, 1.0, 0.25]]", "--set", "infer.alpha=0.3",
+                       "--set", "infer.color=[255, 0, 0]")
+    assert code == 0, err
+    assert len(calls) == 1
+    kw = calls[0]
+    assert Path(kw["video_path"]) == video and Path(kw["out_path"]) == out_dir / "clip_overlay.mp4"
+    assert kw["threshold"] == pytest.approx(0.7)
+    assert (kw["every_n"], kw["max_frames"]) == (3, 4)
+    assert kw["alpha"] == pytest.approx(0.3)
+    assert list(kw["color"]) == [255, 0, 0]
+    assert [list(r) for r in kw["hud_rects"]] == [[0.75, 0.0, 1.0, 0.25]]
+    assert count_video_frames(out_dir / "clip_overlay.mp4") == 4
+
+
+@pytest.mark.parametrize("suffix", [".ts", ".m4v"])
+def test_infer_treats_ts_and_m4v_recordings_as_videos(capsys, trained, tmp_path, suffix):
+    """OBS 的 .ts、.m4v 等录像（extract-frames 能处理）不能被当成图片跳过：之前会提示“无法读取的图片”并以 0 退出。"""
+    src = make_video(tmp_path / "src" / "clip", [make_image(80 + i) for i in range(4)], fps=10.0)
+    rec_dir = tmp_path / "recordings"
+    rec_dir.mkdir()
+    rec = rec_dir / f"rec{suffix}"
+    rec.write_bytes(src.read_bytes())  # OpenCV 按内容识别容器格式
+
+    out_dir = tmp_path / "out"
+    code, out, err = run(capsys, "infer", "-c", trained.cfg, "--ckpt", trained.ckpt, rec, "-o", out_dir)
+    assert code == 0, err
+    assert "无法读取的图片" not in err
+    assert count_video_frames(out_dir / "rec_overlay.mp4") == 4
+    assert f"视频: {rec}" in out
+
+    # 目录输入同样会找到这类录像
+    code, _, err = run(capsys, "infer", "-c", trained.cfg, "--ckpt", trained.ckpt, rec_dir, "-o", tmp_path / "out2")
+    assert code == 0, err
+    assert (tmp_path / "out2" / "rec_overlay.mp4").is_file()
+
+
 @pytest.mark.parametrize(
     "extra, expected",
     [
@@ -1096,6 +1292,20 @@ def test_infer_bad_flags_fail_before_writing(capsys, trained, tmp_path, extra, e
     assert code == 1
     assert expected in err
     assert not out_dir.exists()
+
+
+def test_device_cuda_with_cpu_only_torch_is_a_clean_error(capsys, trained, tmp_path, monkeypatch):
+    """CPU 版 PyTorch 上 --device cuda：打印一行 “错误: …” 和安装提示，而不是 30 多行 AssertionError 堆栈。"""
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: False)
+    monkeypatch.setattr(torch.version, "cuda", None)
+    img = tmp_path / "a.jpg"
+    write_image_rgb(img, make_image(1))
+    code, _, err = run(capsys, "infer", "-c", trained.cfg, "--ckpt", trained.ckpt, img, "-o", tmp_path / "out",
+                       "--device", "cuda")
+    assert code == 1
+    assert "错误: " in err and "CPU 版 PyTorch" in err and "Traceback" not in err
+    code, _, err = run(capsys, "eval", "-c", trained.cfg, "--ckpt", trained.ckpt, "--device", "cuda")
+    assert code == 1 and "CPU 版 PyTorch" in err
 
 
 def test_infer_input_errors(capsys, trained, tmp_path):
@@ -1122,6 +1332,7 @@ def test_export_onnx(capsys, trained, tmp_path):
     assert code == 0, err
     assert out.is_file()
     assert f"已导出 ONNX: {out}" in stdout
+    assert "opset: 17" in stdout  # 打印文件实际的 opset
 
     import onnx
 

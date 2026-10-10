@@ -468,6 +468,26 @@ def test_train_one_epoch_updates_params_steps_scheduler_and_sets_train_mode():
     assert sched.last_epoch == len(loader) == 3  # 每个 iteration step 一次
 
 
+def test_train_one_epoch_uses_fresh_gradients_each_step():
+    """每个 iteration 前都要清零梯度：结果必须与“每步 zero_grad → backward → step”的参考循环完全一致。
+    漏掉 zero_grad 时梯度跨 iteration 累积，参数就会不同（而 loss 照样下降，其他测试发现不了）。"""
+    loader = tiny_loader(6, 2)
+    model = tiny_model()
+    reference = copy.deepcopy(model)
+
+    train_one_epoch(model, loader, SegLoss(), torch.optim.SGD(model.parameters(), lr=0.5), CPU)
+
+    ref_opt = torch.optim.SGD(reference.parameters(), lr=0.5)
+    ref_loss = SegLoss()
+    reference.train()
+    for images, masks in loader:
+        ref_opt.zero_grad()
+        ref_loss(reference(images), masks).backward()
+        ref_opt.step()
+    for p, q in zip(model.parameters(), reference.parameters()):
+        torch.testing.assert_close(p, q)
+
+
 def test_train_one_epoch_reduces_loss_over_epochs():
     model = tiny_model()
     opt = torch.optim.AdamW(model.parameters(), lr=5e-2)
@@ -945,6 +965,24 @@ def test_train_wiring_cpu_disables_amp_and_builds_scheduler(tmp_path, monkeypatc
     assert [float(r["lr"]) for r in rows] == pytest.approx([1e-3 * lam(0), 1e-3 * lam(2), 1e-3 * lam(4)])
 
 
+def test_train_non_default_arch_checkpoint_rebuilds_same_model(tmp_path, monkeypatch):
+    """checkpoint 的 model_cfg 必须记录实际训练的架构（这里是 FPN），否则 eval / infer / export 会按 Unet 重建，
+    严格加载权重时失败。训练/评估循环打桩，只验证保存与重建。"""
+    from dfwalk.infer import Predictor
+
+    make_dataset(tmp_path)
+    cfg = make_cfg(tmp_path, tmp_path / "run", arch="FPN", epochs=1)
+    _stub_loops(monkeypatch, [0.5])
+    best = train(cfg)
+    for path in (best, tmp_path / "run" / "last.pt"):
+        state = load_checkpoint(path)
+        assert state["model_cfg"] == model_config("FPN", ENCODER, NUM_CLASSES)
+        model = model_from_checkpoint(state)  # load_state_dict 为严格模式：结构不一致会抛 RuntimeError
+        assert type(model).__name__ == "FPN"
+    predictor = Predictor.from_checkpoint(best, device="cpu")
+    assert predictor.predict_mask(np.zeros((H, W, 3), np.uint8)).shape == (H, W)
+
+
 def test_train_loss_weights_passed_to_segloss(tmp_path, monkeypatch):
     make_dataset(tmp_path)
     cfg = make_cfg(tmp_path, tmp_path / "run", epochs=1, ce_weight=0.3, dice_weight=2.0)
@@ -982,6 +1020,46 @@ def test_train_nan_loss_raises_floating_point_error(tmp_path, monkeypatch):
     columns, rows = read_history(out_dir / "history.csv")
     assert columns == HISTORY_COLUMNS and rows == []
     assert not (out_dir / "best.pt").exists()
+
+
+@pytest.mark.parametrize(
+    "arch, batch_size, one_frame_train",
+    [("DeepLabV3Plus", 1, False), ("UPerNet", 1, False), ("PAN", 1, False), ("deeplabv3", 2, True)],
+)
+def test_train_rejects_batch_of_one_for_bn_after_global_pool(tmp_path, monkeypatch, arch, batch_size,
+                                                              one_frame_train):
+    """这些架构在全局池化后接 BatchNorm，1 个样本的 batch 会在第一个 iteration 崩溃：
+    应在构建模型之前抛出带 batch_size 提示的 ValueError，而不是 PyTorch 的英文报错。"""
+    make_dataset(tmp_path)
+    if one_frame_train:
+        write_split(tmp_path, "train", ["vidA_000000"])
+        write_split(tmp_path, "val", ["vidB_000000"])
+    cfg = make_cfg(tmp_path, tmp_path / "run", arch=arch, batch_size=batch_size, epochs=1)
+    built = []
+    real_build = train_mod.build_model
+    monkeypatch.setattr(train_mod, "build_model", lambda *a, **k: built.append(a) or real_build(*a, **k))
+    with pytest.raises(ValueError, match="batch_size") as info:
+        train(cfg)
+    assert arch in str(info.value) and "Unet" in str(info.value)
+    assert built == []  # 在构建模型（下载预训练权重）之前就失败
+    assert not (tmp_path / "run" / "best.pt").exists()
+
+
+def test_check_batch_of_one_only_for_affected_archs_and_sizes():
+    def loader(n: int, batch_size: int, drop_last: bool) -> DataLoader:
+        return DataLoader(TensorDataset(torch.zeros(n, 1)), batch_size=batch_size, drop_last=drop_last)
+
+    assert train_mod._smallest_batch(loader(5, 2, True)) == 2
+    assert train_mod._smallest_batch(loader(4, 2, False)) == 2
+    assert train_mod._smallest_batch(loader(5, 2, False)) == 1
+    assert train_mod._smallest_batch(loader(1, 8, False)) == 1
+    train_mod._check_batch_of_one("Unet", loader(3, 1, True))  # Unet 不受影响
+    train_mod._check_batch_of_one("Segformer", loader(1, 8, False))
+    train_mod._check_batch_of_one("DeepLabV3Plus", loader(5, 2, True))  # 每个 batch 都是 2 个样本
+    with pytest.raises(ValueError, match="batch_size"):
+        train_mod._check_batch_of_one("DeepLabV3Plus", loader(5, 1, True))
+    with pytest.raises(ValueError, match="batch_size"):
+        train_mod._check_batch_of_one("upernet", loader(1, 8, False))
 
 
 @pytest.mark.parametrize(

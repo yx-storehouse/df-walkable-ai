@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import pickle
+import struct
 from pathlib import Path
 from typing import Any, Mapping, Sequence
 
@@ -12,6 +14,20 @@ from . import IMAGENET_MEAN, IMAGENET_STD, __version__
 from .model import build_model
 
 CKPT_FORMAT = "dfwalk-ckpt-v1"
+
+# torch.load(weights_only=True) 读到非 torch 文件 / 其他工具的 pickle / 损坏文件时抛出的异常类型（实测：ONNX、YAML、
+# 图片 → UnpicklingError；空文件 → EOFError；CSV → IndexError；纯文本 → KeyError；截断的 .pt、普通 zip → RuntimeError）
+_NOT_A_CHECKPOINT_ERRORS: tuple[type[BaseException], ...] = (
+    pickle.UnpicklingError,
+    EOFError,
+    IndexError,
+    KeyError,
+    ValueError,
+    TypeError,
+    AttributeError,
+    struct.error,
+    RuntimeError,
+)
 
 
 def save_checkpoint(
@@ -44,7 +60,24 @@ def save_checkpoint(
 
 
 def load_checkpoint(path: str | Path, map_location: str | torch.device = "cpu") -> dict[str, Any]:
-    state = torch.load(Path(path), map_location=map_location, weights_only=True)
+    """读取 save_checkpoint 写出的 checkpoint（weights_only=True）。
+
+    文件不存在抛 FileNotFoundError；不是 dfwalk checkpoint 时一律抛 ValueError——包括根本不是 torch 文件的情况
+    （例如误把导出的 model.onnx、config.yaml、图片传给 --ckpt）和已损坏/不完整的文件。torch.load 对这些文件抛出的
+    UnpicklingError / EOFError / IndexError 等原始异常保留在 __cause__ 中（其中“改用 weights_only=False”的建议
+    并不适用）。
+    """
+    path = Path(path)
+    try:
+        state = torch.load(path, map_location=map_location, weights_only=True)
+    except _NOT_A_CHECKPOINT_ERRORS as e:
+        if path.suffix.lower() == ".onnx":
+            hint = "这是导出的 ONNX 模型，请用 onnxruntime 加载（见 README“部署 ONNX 模型”）；"
+        else:
+            hint = ""
+        raise ValueError(
+            f"不是 dfwalk checkpoint，或文件已损坏，无法读取: {path}。{hint}--ckpt 需要 dfwalk train 输出的 best.pt / last.pt"
+        ) from e
     if not isinstance(state, dict) or state.get("format") != CKPT_FORMAT:
         raise ValueError(f"不是 dfwalk checkpoint（缺少 format={CKPT_FORMAT}）: {path}")
     return state

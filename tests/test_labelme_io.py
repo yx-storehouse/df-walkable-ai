@@ -1074,6 +1074,26 @@ def test_convert_labelme_dir_applies_hud_ignore(tmp_path):
     assert np.array_equal(read_mask(written[0]), np.full((20, 40), W, np.uint8))
 
 
+def test_convert_labelme_dir_uncovered_pixels_are_non_walkable(tmp_path):
+    """README：没有被任何形状覆盖的像素当作不可走（从零标注时只画可走区域）；HUD 仍置为忽略。
+    如果未覆盖像素变成 255，不可走区域就完全没有监督。"""
+    json_dir, out_dir = tmp_path / "labelme", tmp_path / "masks"
+    bottom = [(0, 10), (39, 10), (39, 19), (0, 19)]  # 只画了下半部分的可走区域
+    save_labelme(json_dir / "partial.json", _doc([_poly("walkable", bottom)], h=20, w=40))
+    save_labelme(json_dir / "no_shapes.json", _doc([], h=20, w=40))
+    hud = [[0.0, 0.0, 0.25, 0.25]]
+
+    convert_labelme_dir(json_dir, out_dir, hud_rects=hud)
+
+    expected = np.full((20, 40), N, np.uint8)
+    expected[10:] = W
+    expected[:5, :10] = I
+    assert np.array_equal(read_mask(out_dir / "partial.png"), expected)
+    expected_empty = np.full((20, 40), N, np.uint8)
+    expected_empty[:5, :10] = I
+    assert np.array_equal(read_mask(out_dir / "no_shapes.png"), expected_empty)
+
+
 def test_convert_labelme_dir_error_contains_filename(tmp_path):
     json_dir = tmp_path / "labelme"
     save_labelme(json_dir / "good.json", _doc([], 5, 5))

@@ -635,6 +635,38 @@ def test_infer_video_overlay_colors_and_hud(tmp_path):
     assert abs(hud_px - 60) < 10
 
 
+class RedIsWalkable(nn.Module):
+    """可走 logit = 20 * (通道0 - 通道2)（归一化后的输入）：输入按 RGB 排列时红色画面可走，按 BGR 排列时不可走。"""
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        n, _, h, w = x.shape
+        out = torch.zeros(n, 2, h, w, dtype=x.dtype, device=x.device)
+        out[:, WALKABLE] = 20.0 * (x[:, 0] - x[:, 2])
+        return out
+
+
+def test_infer_video_feeds_rgb_frames_to_model(tmp_path, monkeypatch):
+    """cv2.VideoCapture 读出的是 BGR：送进模型（训练时是 RGB）和叠加图之前必须转成 RGB。
+    灰色帧和不看像素的桩模型发现不了通道顺序错误，这里用红色视频 + 对颜色敏感的模型。"""
+    import dfwalk.infer as infer_mod
+
+    src = make_video(tmp_path, 3, value_fn=lambda i: (20, 30, 230))  # 写入的是 BGR：(B, G, R) → 红色
+    seen: list[tuple[np.ndarray, np.ndarray]] = []
+    real_overlay = infer_mod.overlay
+
+    def recording_overlay(image, mask, *args, **kwargs):
+        seen.append((image.copy(), mask.copy()))
+        return real_overlay(image, mask, *args, **kwargs)
+
+    monkeypatch.setattr(infer_mod, "overlay", recording_overlay)
+    infer_video(Predictor(RedIsWalkable(), IMAGE_SIZE), src, tmp_path / "o.mp4")
+    assert len(seen) == 3
+    body = np.s_[:, VID_W // 4 + 8:]  # make_video 左侧 1/4 是灰色条
+    for image, mask in seen:
+        assert image[body][..., 0].mean() > image[body][..., 2].mean() + 100  # 叠加图收到的是 RGB
+        assert (mask[body] == WALKABLE).mean() > 0.95  # 模型看到的是红色（R > B）
+
+
 def test_infer_video_fps_fallback(tmp_path, monkeypatch):
     import dfwalk.infer as infer_mod
 

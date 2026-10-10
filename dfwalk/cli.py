@@ -251,6 +251,22 @@ def _require_file(path: str | Path, what: str) -> Path:
     return p
 
 
+def _quote_arg(arg: str, windows: bool | None = None) -> str:
+    """把路径等参数转成可直接粘贴到终端的形式（含空格等特殊字符时加引号）。
+
+    windows 为 None 时按当前系统判断：Windows 用双引号（cmd 与 PowerShell 通用），其他系统用 shlex.quote。
+    """
+    if windows is None:
+        windows = os.name == "nt"
+    if windows:
+        import subprocess
+
+        return subprocess.list2cmdline([arg])
+    import shlex
+
+    return shlex.quote(arg)
+
+
 def _list_files(folder: Path, suffix: str) -> list[Path]:
     """目录下（不递归）指定后缀（大小写不敏感）的文件；目录不存在时返回空列表。"""
     if not folder.is_dir():
@@ -436,11 +452,12 @@ def _cmd_to_labelme(args: argparse.Namespace, cfg: Config) -> int:
     if skipped:
         msg += f"（{skipped} 个掩码被跳过：JSON 已存在（不会覆盖人工修正结果，需要时加 --overwrite）或找不到对应图片）"
     print(msg)
+    # LabelMe >= 6 默认自动保存、不把图片数据写进 JSON；7.x 已删除 --nodata / --autosave，写上会直接报错退出
     _info(
-        "下一步: 用 LabelMe 修正标注，例如\n"
-        f"  labelme {images_dir.as_posix()} --output {out_dir.as_posix()} "
-        "--labels walkable,non_walkable,ignore --nodata --autosave\n"
-        "修正完成后运行 dfwalk from-labelme"
+        "下一步: 用 LabelMe（>= 6）修正标注，例如\n"
+        f"  labelme {_quote_arg(images_dir.as_posix())} --output {_quote_arg(out_dir.as_posix())} "
+        "--labels walkable,non_walkable,ignore\n"
+        "（LabelMe 5.x 需要在末尾加上 --nodata --autosave）修正完成后运行 dfwalk from-labelme"
     )
     return 0
 
@@ -689,10 +706,19 @@ def format_metrics_table(metrics: Mapping[str, float]) -> str:
 
 
 def _cmd_train(args: argparse.Namespace, cfg: Config) -> int:
-    from .train import train
+    from .train import BEST_NAME, LAST_NAME, train
 
     _override(cfg.train, epochs=args.epochs, batch_size=args.batch_size, out_dir=args.out_dir, device=args.device)
     _validate(cfg)
+    # 新的训练在第 1 个 epoch 结束时就会替换 best.pt（并重写 history.csv），上一版模型将无法找回
+    out_dir = Path(cfg.train.out_dir)
+    existing = [p for p in (out_dir / BEST_NAME, out_dir / LAST_NAME) if p.exists()]
+    if existing and not args.force:
+        raise CLIError(
+            f"输出目录中已有训练结果: {', '.join(str(p) for p in existing)}。重新训练会覆盖它们"
+            "（第 1 个 epoch 结束时就会替换 best.pt，history.csv 也会重写）。"
+            "请用 --out-dir 指定新目录（例如 runs/exp2）保留上一版模型，确认要覆盖请加 --force"
+        )
     best = train(cfg)
     print(f"最佳 checkpoint: {best}")
     _info(f"下一步: dfwalk eval --ckpt {best.as_posix()}，或 dfwalk infer --ckpt {best.as_posix()} <图片/目录/视频>")
@@ -815,12 +841,16 @@ def _cmd_infer(args: argparse.Namespace, cfg: Config) -> int:
 
 
 def _cmd_export_onnx(args: argparse.Namespace, cfg: Config) -> int:
-    from .export import export_onnx
+    from .export import export_onnx, onnx_opset
 
     ckpt = _require_file(args.ckpt, "checkpoint ")
     out = export_onnx(ckpt, args.output, opset=args.opset, dynamic_batch=not args.static_batch)
     batch = "1" if args.static_batch else "batch（动态）"
     print(f"已导出 ONNX: {out}")
+    actual_opset = onnx_opset(out)  # 未安装 onnx 包时为 None
+    if actual_opset is not None:
+        note = "" if actual_opset == args.opset else f"（要求的是 {args.opset}，见上方警告）"
+        print(f"  opset: {actual_opset}{note}")
     print(
         f"  输入 image: float32 ({batch}, 3, H, W)，RGB，按 (x/255 - mean)/std 归一化（H/W/mean/std 见模型 metadata）\n"
         f"  输出 logits: ({batch}, 2, H, W)，未经 softmax，第 {WALKABLE} 通道为可走"
@@ -1004,12 +1034,14 @@ def build_parser() -> argparse.ArgumentParser:
     p = _add_command(
         sub, "train", _cmd_train, "训练",
         "训练可走区域分割模型。输出目录中有 best.pt（验证集 iou_walkable 最高）、last.pt、history.csv、config.yaml。\n"
+        "输出目录中已有 best.pt / last.pt 时默认拒绝训练（以免覆盖上一版模型），换一个 --out-dir 或加 --force。\n"
         "没有划分文件时会自动按视频分组划分。其余超参数用 --set train.xxx=... 修改。",
     )
     p.add_argument("--epochs", type=int, metavar="N", help="训练轮数（默认取 train.epochs）")
     p.add_argument("--batch-size", type=int, metavar="N", help="batch 大小（默认取 train.batch_size）")
     p.add_argument("--out-dir", metavar="DIR", help="输出目录（默认取 train.out_dir）")
     p.add_argument("--device", metavar="DEVICE", help="auto / cpu / cuda / cuda:0 / mps（默认取 train.device）")
+    p.add_argument("--force", action="store_true", help="输出目录中已有 best.pt / last.pt 时也继续训练（会覆盖它们）")
 
     # eval
     p = _add_command(

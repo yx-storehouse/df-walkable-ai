@@ -401,6 +401,21 @@ def test_walkable_prob_downscales_large_image():
     assert tuple(model.calls[0]["pixel_values"].shape) == (1, 3, 128, 224)
 
 
+def test_walkable_prob_non_integer_downscale_uses_area():
+    """1280x720 → 短边 512 这类非整数倍缩小必须用 INTER_AREA（整数倍时 INTER_LINEAR 结果相同，测不出来）。"""
+    import cv2
+
+    model = FakeSegModel()
+    lab = make_labeler(model, image_mean=(0.0, 0.0, 0.0), image_std=(1.0, 1.0, 1.0), short_side=64)
+    img = random_image(100, 150, seed=4)  # → (64, 96)，缩小 1.5625 倍
+    lab.walkable_prob(img)
+    pv = model.calls[0]["pixel_values"][0].permute(1, 2, 0).numpy()
+    area = cv2.resize(img, (96, 64), interpolation=cv2.INTER_AREA)
+    linear = cv2.resize(img, (96, 64), interpolation=cv2.INTER_LINEAR)
+    assert np.abs(area.astype(int) - linear.astype(int)).max() > 20  # 本用例确实能区分两种插值
+    np.testing.assert_allclose(pv, area.astype(np.float32) / 255.0, atol=1e-6)
+
+
 def test_walkable_prob_only_upsamples_one_channel(monkeypatch):
     """150 通道 logits 不能被上采样到原图分辨率：F.interpolate 只能收到 1 通道输入。"""
     seen: list[tuple[int, ...]] = []
@@ -657,9 +672,13 @@ def test_autolabel_folder_skips_corrupt_image_with_warning(tmp_path):
 
 
 def test_from_pretrained_without_transformers(monkeypatch):
+    """安装提示必须是能执行的命令：dfwalk 不在 PyPI 上，pip install "dfwalk[autolabel]" 会找不到包。"""
     monkeypatch.setitem(sys.modules, "transformers", None)  # import transformers → ImportError
-    with pytest.raises(ImportError, match=r"dfwalk\[autolabel\]"):
+    with pytest.raises(ImportError) as info:
         AutoLabeler.from_pretrained("nvidia/segformer-b0-finetuned-ade-512-512", ["floor"])
+    message = str(info.value)
+    assert 'pip install -e ".[autolabel]"' in message and "pip install transformers" in message
+    assert '"dfwalk[autolabel]"' not in message
 
 
 def test_from_pretrained_wiring_with_fake_transformers(monkeypatch):

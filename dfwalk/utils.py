@@ -18,11 +18,30 @@ from . import IMAGE_EXTS
 
 
 def resolve_device(name: str = "auto"):
-    """"auto" → cuda > mps > cpu；其余字符串原样交给 torch.device。"""
+    """"auto" → cuda > mps > cpu；其余字符串交给 torch.device。
+
+    显式指定 cuda（cuda:0 等）/ mps 但当前 PyTorch 用不了时抛 ValueError 并给出解决办法——最常见的原因是
+    装了 CPU 版 PyTorch（Windows 上直接 pip install 得到的就是 CPU 版，此时要先卸载再装 CUDA 版）；否则要等到
+    model.to(device) 才抛出没有说明的 AssertionError（“Torch not compiled with CUDA enabled”）。
+    """
     import torch
 
     if name != "auto":
-        return torch.device(name)
+        device = torch.device(name)
+        if device.type == "cuda" and not torch.cuda.is_available():
+            if torch.version.cuda is None:
+                # 必须先卸载：已装 CPU 版时第 3 步的命令只会提示 “Requirement already satisfied”，不会替换成 CUDA 版
+                reason = ("当前安装的是 CPU 版 PyTorch。请先运行 pip uninstall -y torch torchvision 卸载 CPU 版，"
+                          "再按 README 安装步骤第 3 步安装 CUDA 版 PyTorch")
+            else:
+                reason = "PyTorch 支持 CUDA，但检测不到可用的 NVIDIA 显卡或驱动。请检查显卡驱动"
+            raise ValueError(f"指定了设备 {name}，但当前 PyTorch 无法使用 CUDA：{reason}，或改用 --device auto / cpu")
+        if device.type == "mps" and not (
+            getattr(torch.backends, "mps", None) is not None and torch.backends.mps.is_available()
+        ):
+            raise ValueError(f"指定了设备 {name}，但当前 PyTorch 无法使用 MPS（仅支持 Apple Silicon 的 macOS），"
+                             "请改用 --device auto / cpu")
+        return device
     if torch.cuda.is_available():
         return torch.device("cuda")
     if getattr(torch.backends, "mps", None) is not None and torch.backends.mps.is_available():

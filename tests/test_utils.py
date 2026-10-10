@@ -6,6 +6,8 @@
 from __future__ import annotations
 
 import random
+import re
+from pathlib import Path
 
 import cv2
 import numpy as np
@@ -205,8 +207,88 @@ def test_bgr_to_rgb_does_not_modify_input():
 
 def test_resolve_device():
     assert resolve_device("cpu") == torch.device("cpu")
-    assert resolve_device("cuda:1") == torch.device("cuda:1")  # 只构造 device，不要求真的有 GPU
     assert resolve_device("auto").type in ("cpu", "cuda", "mps")
+    if torch.cuda.is_available():
+        assert resolve_device("cuda:0") == torch.device("cuda:0")
+
+
+def test_resolve_device_cuda_unavailable_gives_actionable_error(monkeypatch):
+    """CPU 版 PyTorch 上指定 cuda：立即抛带安装提示的 ValueError，而不是等到 model.to() 抛 AssertionError。"""
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: False)
+    monkeypatch.setattr(torch.version, "cuda", None)
+    for name in ("cuda", "cuda:1"):
+        with pytest.raises(ValueError, match="CPU 版 PyTorch") as info:
+            resolve_device(name)
+        assert "第 3 步" in str(info.value) and "--device auto / cpu" in str(info.value)
+    # CUDA 版 PyTorch 但没有可用显卡/驱动
+    monkeypatch.setattr(torch.version, "cuda", "12.8")
+    with pytest.raises(ValueError, match="驱动") as info:
+        resolve_device("cuda")
+    assert "uninstall" not in str(info.value)
+    assert resolve_device("cpu") == torch.device("cpu")
+
+
+def test_cpu_torch_remedy_uninstalls_before_step_3(monkeypatch):
+    """已装 CPU 版 PyTorch 时，第 3 步的 pip install（无版本号、无 --force-reinstall）只会提示
+    “Requirement already satisfied” 而不替换，所以报错信息和 README 都必须先让用户卸载 CPU 版，再执行第 3 步。"""
+    uninstall = "pip uninstall -y torch torchvision"
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: False)
+    monkeypatch.setattr(torch.version, "cuda", None)
+    with pytest.raises(ValueError) as info:
+        resolve_device("cuda")
+    message = str(info.value)
+    assert uninstall in message and message.index(uninstall) < message.index("第 3 步")
+
+    readme = (Path(__file__).resolve().parents[1] / "README.md").read_text(encoding="utf-8")
+    # 安装步骤第 3 步：在 CUDA 版的安装命令之前提示先卸载
+    step3 = readme[readme.index("# 3. "):readme.index("# 4. ")]
+    assert uninstall in step3 and step3.index(uninstall) < step3.index("pip install torch torchvision")
+    # 常见问题 “训练没有用上显卡？”（报错信息让用户去 README 找的解决办法）
+    faq = readme[readme.index("**训练没有用上显卡？**"):]
+    faq = faq[:faq.index("\n**", 1)]
+    assert uninstall in faq and faq.index(uninstall) < faq.index("第 3 步")
+
+
+def test_faq_gpu_check_distinguishes_cpu_build_from_missing_driver(monkeypatch, capsys):
+    """常见问题 “训练没有用上显卡？” 要和 resolve_device 一样按 torch.version.cuda 区分两种 is_available() == False：
+    只有 CPU 版（version.cuda 为 None）才卸载后按第 3 步重装；CUDA 版但检测不到显卡/驱动时卸载重装没用，
+    只会白白重新下载几 GB 的 CUDA 版，应该去查驱动。这里实际执行 FAQ 里的检查命令，按它的输出找到 FAQ 对应的那一条。"""
+    uninstall = "pip uninstall -y torch torchvision"
+    readme = (Path(__file__).resolve().parents[1] / "README.md").read_text(encoding="utf-8")
+    faq = readme[readme.index("**训练没有用上显卡？**"):]
+    faq = faq[:faq.index("\n**", 1)]
+    command = re.search(r'python -c "([^"]+)"', faq)
+    assert command is not None
+    items = faq.split("\n- ")[1:]
+
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: False)
+    found = {}
+    for cuda_version in (None, "12.8"):
+        monkeypatch.setattr(torch.version, "cuda", cuda_version)
+        exec(command.group(1), {})
+        printed = capsys.readouterr().out.strip()
+        matching = [item for item in items if f"`{printed}`" in item]
+        assert len(matching) == 1, f"FAQ 没有（或不止一条）说明检查命令输出 {printed!r} 的情况"
+        with pytest.raises(ValueError) as info:
+            resolve_device("cuda")
+        found[cuda_version] = (matching[0], str(info.value))
+
+    # CPU 版：先卸载，再按第 3 步装 CUDA 版（与报错信息一致）
+    cpu_item, cpu_message = found[None]
+    assert uninstall in cpu_message
+    assert uninstall in cpu_item and cpu_item.index(uninstall) < cpu_item.index("第 3 步")
+    # CUDA 版但用不了显卡：先查驱动 / 独显，不让用户先卸载重装（与报错信息一致）
+    cuda_item, cuda_message = found["12.8"]
+    assert "驱动" in cuda_message and "uninstall" not in cuda_message
+    assert "驱动" in cuda_item and "nvidia-smi" in cuda_item and "不要" in cuda_item
+    if "uninstall" in cuda_item:
+        assert cuda_item.index("驱动") < cuda_item.index("uninstall")
+
+
+def test_resolve_device_mps_unavailable(monkeypatch):
+    monkeypatch.setattr(torch.backends.mps, "is_available", lambda: False)
+    with pytest.raises(ValueError, match="MPS"):
+        resolve_device("mps")
 
 
 def test_seed_everything_is_reproducible():

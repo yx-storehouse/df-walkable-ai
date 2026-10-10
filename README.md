@@ -65,6 +65,8 @@ python -m venv .venv
 source .venv/bin/activate
 
 # 3. （有 NVIDIA 显卡时）先安装 CUDA 版 PyTorch。
+#    如果之前已经装过 CPU 版（例如先做了第 4 步），要先运行 pip uninstall -y torch torchvision，
+#    否则下面的命令只会提示 “Requirement already satisfied”，不会换成 CUDA 版。
 #    具体命令以 https://pytorch.org/get-started/locally/ 为准，按你的显卡驱动选择 CUDA 版本，例如：
 pip install torch torchvision --index-url https://download.pytorch.org/whl/cu128
 
@@ -131,7 +133,7 @@ copy configs\default.yaml configs\my.yaml
 
 ### 1. 用 OBS 录制对局
 
-- 录制格式选 **mkv**（OBS 崩溃时文件也不会损坏），本项目直接支持 `.mp4 .mkv .avi .mov .flv .webm`。
+- 录制格式选 **mkv**（OBS 崩溃时文件也不会损坏），本项目直接支持 `.mp4 .mkv .avi .mov .flv .webm .ts .m2ts .mts .m4v .wmv`。
 - 分辨率和游戏一致即可（1080p 或 1440p 都行），帧率 30 就够用，抽帧时会缩放。
 - **录制期间不要改变 UI 缩放和分辨率**，否则 HUD 位置会变。关闭 OBS 的摄像头/弹幕叠加，以及显卡驱动或平台的帧数显示；如果关不掉，就把它们也写进 `hud.rects`。
 - 多录几段：不同地图、白天/夜晚、不同天气、室内/室外都要有（见[数据建议](#数据建议)）。
@@ -203,15 +205,17 @@ dfwalk to-labelme -c configs/my.yaml
 LabelMe 是独立的标注工具，建议装在单独的环境里，以免和本项目的依赖冲突：
 
 ```bash
-pipx install labelme
-# 或者：另建一个虚拟环境，然后 pip install labelme
+pipx install "labelme>=6"
+# 或者：另建一个虚拟环境，然后 pip install "labelme>=6"
 ```
 
 打开图片目录，让 LabelMe 从 `data/labelme/` 读取和保存标注：
 
 ```bash
-labelme data/images --output data/labelme --labels walkable,non_walkable,ignore --nodata --autosave
+labelme data/images --output data/labelme --labels walkable,non_walkable,ignore
 ```
+
+LabelMe 6 及以上默认自动保存，并且不会把图片数据写进 JSON，不需要额外参数（7.x 已经删除了 `--nodata` / `--autosave`，加上会直接报错退出）。如果你用的是旧版 LabelMe 5.x，请在上面的命令末尾加上 `--nodata --autosave`。路径中有空格时，请给路径加上双引号。
 
 修正技巧：
 
@@ -264,6 +268,7 @@ dfwalk train -c configs/my.yaml --epochs 50 --batch-size 8
 ```
 
 - 输出到 `runs/exp/`（`--out-dir` 可以修改）：`best.pt`（验证集 `iou_walkable` 最高的一轮）、`last.pt`、`history.csv`（每轮的 loss 和指标）、`config.yaml`（本次训练用的完整配置）。
+- 输出目录中已经有 `best.pt` / `last.pt` 时默认**拒绝训练**：重新训练会在第 1 轮结束时就替换 `best.pt`，上一版模型无法找回。补充数据后再训练时，用新的目录保留上一版，例如 `--out-dir runs/exp2`（后面的 `eval` / `infer` / `export-onnx` 命令里的 `runs/exp/best.pt` 也要跟着改）；确认要覆盖时加 `--force`。
 - 如果还没有划分文件，训练前会自动划分。
 - `--device cpu` / `--device cuda` 可以指定设备；在 CUDA 上默认开启混合精度（AMP）。
 - 其他超参数用 `--set` 修改，例如 `--set train.lr=0.0005 --set train.encoder=resnet50`。
@@ -295,7 +300,7 @@ dfwalk infer -c configs/my.yaml --ckpt runs/exp/best.pt data/images/零号大坝
 dfwalk export-onnx --ckpt runs/exp/best.pt -o runs/exp/model.onnx
 ```
 
-导出的 ONNX 模型可以用 onnxruntime、TensorRT 等推理引擎做离线分析，用法见[部署 ONNX 模型](#部署-onnx-模型)。`--static-batch` 会把 batch 维固定为 1，`--opset` 可以指定 opset 版本（默认 17）。
+导出的 ONNX 模型可以用 onnxruntime、TensorRT 等推理引擎做离线分析，用法见[部署 ONNX 模型](#部署-onnx-模型)。`--static-batch` 会把 batch 维固定为 1，`--opset` 可以指定 opset 版本（默认 17）。命令会打印文件实际的 opset：少数结构（例如默认尺寸下的 `UPerNet`）只能改用 torch.export（dynamo）导出器，实际 opset 会是 18，此时会给出警告。
 
 ---
 
@@ -330,7 +335,7 @@ dfwalk export-onnx --ckpt runs/exp/best.pt -o runs/exp/model.onnx
 - 至少录 **3–5 段**不同的视频，验证集里最好有一整张训练集没见过的地图，这样才能真实反映泛化能力。
 - 抽帧不要太密：`--fps 1` 到 `--fps 2` 配合默认去重即可。同一场景的帧太多，只会让数据集“看起来很大”。
 - 截图也可以用：放进 `data/images/`，命名为 `{分组名}_{数字}.png`（例如 `截图_巴克什_000001.png`），以便正确分组。
-- 新增标注后，运行 `dfwalk split --force` 重新划分，再运行 `check-data`。
+- 新增标注后，运行 `dfwalk split --force` 重新划分，再运行 `check-data`。重新训练时用新的 `--out-dir`（例如 `runs/exp2`），保留上一版模型以便对比。
 
 ---
 
@@ -348,7 +353,7 @@ dfwalk export-onnx --ckpt runs/exp/best.pt -o runs/exp/model.onnx
 ### 主要超参数
 
 - **image_size**：`[高, 宽]`，必须都是 32 的倍数。16:9 画面推荐 `[384, 672]`（默认）、`[288, 512]`（更快）或 `[576, 1024]`（细节更好，显存占用约为默认的 2.3 倍）。
-- **batch_size**：显存不足（`CUDA out of memory`）时，先减小它，再减小 `image_size`。
+- **batch_size**：显存不足（`CUDA out of memory`）时，先减小它，再减小 `image_size`。`DeepLabV3` / `DeepLabV3Plus` / `PAN` / `UPerNet` 要求 `batch_size` 至少为 2。
 - **arch / encoder**（来自 segmentation_models_pytorch）：
 
   | 组合 | 特点 |
@@ -405,8 +410,9 @@ mean = np.array(json.loads(meta["dfwalk.mean"]), np.float32)
 std = np.array(json.loads(meta["dfwalk.std"]), np.float32)
 
 img = cv2.cvtColor(cv2.imread("shot.jpg"), cv2.COLOR_BGR2RGB)
-# 与训练一致：缩小用 INTER_AREA，放大用 INTER_LINEAR
-x = cv2.resize(img, (w, h), interpolation=cv2.INTER_AREA).astype(np.float32) / 255.0
+# 与训练一致：宽、高都缩小时用 INTER_AREA，只要有一个方向放大就用 INTER_LINEAR
+interp = cv2.INTER_AREA if (w <= img.shape[1] and h <= img.shape[0]) else cv2.INTER_LINEAR
+x = cv2.resize(img, (w, h), interpolation=interp).astype(np.float32) / 255.0
 x = ((x - mean) / std).transpose(2, 0, 1)[None]
 
 logits = sess.run(["logits"], {"image": x})[0]
@@ -479,7 +485,7 @@ dfwalk train -c configs/my.yaml --set train.encoder=resnet18 --set "data.image_s
 | `dfwalk from-labelme` | LabelMe JSON → 掩码 | `-i` `-o` |
 | `dfwalk split` | 按视频划分训练/验证集 | `--val-ratio` `--seed` `--force` |
 | `dfwalk check-data` | 检查数据、统计标签、输出可视化 | `--vis-dir` `--vis-limit` |
-| `dfwalk train` | 训练 | `--epochs` `--batch-size` `--out-dir` `--device` |
+| `dfwalk train` | 训练 | `--epochs` `--batch-size` `--out-dir` `--device` `--force` |
 | `dfwalk eval --ckpt PATH` | 评估 | `--split` `--device` |
 | `dfwalk infer --ckpt PATH INPUT...` | 推理图片/目录/视频 | `-o` `--threshold` `--every-n` `--max-frames` `--no-mask` `--device` |
 | `dfwalk export-onnx --ckpt PATH` | 导出 ONNX | `-o` `--opset` `--static-batch` |
@@ -546,7 +552,10 @@ set HF_ENDPOINT=https://hf-mirror.com
 图片和掩码的读写都支持中文路径。读取视频时，如果 OpenCV 打不开中文路径，程序会自动改用 8.3 短路径重试，仍然失败时请把视频移到纯英文路径下。`infer` 输出视频时，如果遇到“无法创建输出视频”，请把 `-o` 指向纯英文目录。
 
 **训练没有用上显卡？**
-运行 `python -c "import torch; print(torch.cuda.is_available())"`。如果输出 `False`，说明装的是 CPU 版 PyTorch，请按[安装步骤](#安装步骤)第 3 步重新安装 CUDA 版。
+运行 `python -c "import torch; print(torch.version.cuda, torch.cuda.is_available())"`，按输出处理（给训练命令加上 `--device cuda` 再运行一次，程序也会直接说明是哪种情况）：
+
+- 输出 `None False`：装的是 CPU 版 PyTorch。请先运行 `pip uninstall -y torch torchvision` 卸载 CPU 版，再按[安装步骤](#安装步骤)第 3 步安装 CUDA 版（不先卸载的话，第 3 步的命令只会提示 “Requirement already satisfied”，装的仍是 CPU 版）。
+- 输出 CUDA 版本号和 `False`（例如 `12.8 False`）：PyTorch 已经是 CUDA 版，**不要**卸载重装，重装后结果还是一样。问题出在显卡或驱动：运行 `nvidia-smi`，确认能看到显卡，并且右上角的 “CUDA Version” 不低于上面输出的版本号，否则请更新 NVIDIA 显卡驱动；笔记本还要确认独立显卡没有被关掉（例如切到了“集显模式”或“节能模式”）。实在不能更新驱动时，才需要先 `pip uninstall -y torch torchvision`，再用 pytorch.org 上 CUDA 版本更低的命令重新安装。
 
 **`CUDA out of memory`？**
 减小 `--batch-size`，或者减小 `data.image_size`，或者换用更小的编码器（`resnet18`）。

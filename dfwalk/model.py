@@ -20,6 +20,11 @@ _NO_WEIGHTS_STRINGS = ("", "none", "null")
 # 连接/离线错误）、下载不完整（EOFError）、缓存文件损坏或格式不兼容（UnpicklingError / RuntimeError）
 _WEIGHT_LOAD_ERRORS: tuple[type[BaseException], ...] = (OSError, EOFError, RuntimeError, pickle.UnpicklingError)
 
+# 解码器在全局平均池化（输出 1x1）之后接 BatchNorm 的架构（smp 小写名）：DeepLabV3 / DeepLabV3Plus 的 ASPP 池化分支、
+# PAN 的 FPA、UPerNet 的 PPM。训练模式下 batch 只有 1 个样本时这层 BatchNorm 无法计算统计量，
+# PyTorch 会抛 "Expected more than 1 value per channel when training"。
+ARCHS_NEEDING_BATCH_OF_TWO = frozenset({"deeplabv3", "deeplabv3plus", "pan", "upernet"})
+
 
 def available_archs() -> list[str]:
     """当前安装的 smp 支持的架构名（类名写法，如 "Unet"、"DeepLabV3Plus"），按 smp 注册顺序。"""

@@ -35,7 +35,7 @@ from .config import Config, validate
 from .dataset import WalkableDataset, find_pairs, make_splits, read_split, write_split
 from .losses import SegLoss
 from .metrics import ConfusionMatrix
-from .model import build_model, model_config
+from .model import ARCHS_NEEDING_BATCH_OF_TWO, build_model, model_config
 from .transforms import EvalTransform, TrainTransform
 from .utils import resolve_device, seed_everything
 
@@ -155,6 +155,28 @@ def build_loaders(cfg: Config) -> tuple[DataLoader, DataLoader]:
     train_loader = _make_loader(train_ds, cfg, shuffle=True, drop_last=len(train_ds) > int(cfg.train.batch_size))
     val_loader = _make_loader(val_ds, cfg, shuffle=False, drop_last=False)
     return train_loader, val_loader
+
+
+def _smallest_batch(loader: DataLoader) -> int:
+    """loader 一个 epoch 中最小的 batch 样本数（数据集非空）。"""
+    n, batch_size = len(loader.dataset), int(loader.batch_size)
+    if loader.drop_last or n % batch_size == 0:
+        return batch_size
+    return n % batch_size
+
+
+def _check_batch_of_one(arch: str, train_loader: DataLoader) -> None:
+    """ARCHS_NEEDING_BATCH_OF_TWO 中的架构在训练时遇到只有 1 个样本的 batch 会在第一个 iteration 崩溃
+    （PyTorch 只给出一行英文报错），这里在构建模型、下载预训练权重之前就给出可操作的中文提示（ValueError）。"""
+    if str(arch).lower() not in ARCHS_NEEDING_BATCH_OF_TWO or _smallest_batch(train_loader) > 1:
+        return
+    n = len(train_loader.dataset)
+    raise ValueError(
+        f"train.arch={arch} 的解码器在全局池化之后使用 BatchNorm，训练时每个 batch 至少要有 2 个样本，"
+        f"但当前 batch_size={train_loader.batch_size}、训练集 {n} 帧，会产生只有 1 个样本的 batch。"
+        "请把 batch_size 设为 >= 2（显存不足时改为减小 data.image_size 或换用更小的 encoder），"
+        "或者改用 Unet / FPN / Segformer 等架构"
+    )
 
 
 # ---------------------------------------------------------------- 训练 / 评估循环
@@ -325,6 +347,8 @@ def train(cfg: Config) -> Path:
 
     补充说明：
     - 开始前调用 dfwalk.config.validate(cfg)；train.epochs 必须 >= 1，否则抛 ValueError。
+    - arch 属于 model.ARCHS_NEEDING_BATCH_OF_TWO（DeepLabV3 / DeepLabV3Plus / PAN / UPerNet）且训练时会出现
+      只有 1 个样本的 batch（batch_size == 1，或训练集只有 1 帧）时，在构建模型之前抛 ValueError。
     - 学习率调度见 make_lr_lambda（总步数 = epochs * len(train_loader)）。
     - 训练 loss 出现 NaN/Inf 时 FloatingPointError 直接向上抛出，已保存的 last.pt / best.pt 保留。
     """
@@ -340,6 +364,7 @@ def train(cfg: Config) -> Path:
     _write_config(out_dir / CONFIG_NAME, cfg)
 
     train_loader, val_loader = build_loaders(cfg)
+    _check_batch_of_one(cfg.train.arch, train_loader)
 
     model = build_model(cfg.train.arch, cfg.train.encoder, encoder_weights=cfg.train.encoder_weights,
                         num_classes=NUM_CLASSES).to(device)

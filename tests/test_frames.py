@@ -284,6 +284,16 @@ def test_resize_max_side_extreme_aspect_keeps_one_pixel():
     assert out.shape == (1, 100, 3)
 
 
+def test_resize_max_side_non_integer_factor_uses_area():
+    """真实场景 1080p → max_side 1280 是 1.5 倍缩小：必须用 INTER_AREA（整数倍时它与 INTER_LINEAR 结果相同，测不出来）。"""
+    img = np.random.default_rng(3).integers(0, 256, size=(60, 120, 3), dtype=np.uint8)
+    out = resize_max_side(img, 80)
+    area = cv2.resize(img, (80, 40), interpolation=cv2.INTER_AREA)
+    linear = cv2.resize(img, (80, 40), interpolation=cv2.INTER_LINEAR)
+    assert np.abs(area.astype(int) - linear.astype(int)).max() > 20  # 本用例确实能区分两种插值
+    np.testing.assert_array_equal(out, area)
+
+
 def test_resize_max_side_grayscale_and_area_average():
     img = np.zeros((4, 8), np.uint8)
     img[:, ::2] = 200  # 竖条纹，INTER_AREA 缩小后取平均

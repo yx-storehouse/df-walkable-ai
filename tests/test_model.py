@@ -274,3 +274,38 @@ def test_checkpoint_round_trip(tmp_path):
     with torch.no_grad():
         got = restored(x)
     torch.testing.assert_close(got, expected)
+
+
+@pytest.mark.parametrize(
+    "name, content",
+    [
+        ("model.onnx", b"\x08\x07\x12\x07pytorch:\x8a\x01\n"),  # 误把导出的 ONNX 当成 checkpoint
+        ("config.yaml", "data:\n  root: data\n".encode("utf-8")),
+        ("history.csv", b"epoch,lr\n1,0.1\n"),
+        ("notes.txt", b"hello world"),
+        ("empty.pt", b""),
+        ("shot.jpg", b"\xff\xd8\xff\xe0\x00\x10JFIF\x00"),
+    ],
+)
+def test_load_checkpoint_rejects_non_checkpoint_files_with_value_error(tmp_path, name, content):
+    """非 torch 文件不能把 UnpicklingError / IndexError 等原始异常（及“改用 weights_only=False”的建议）抛给用户。"""
+    path = tmp_path / name
+    path.write_bytes(content)
+    with pytest.raises(ValueError, match="不是 dfwalk checkpoint") as info:
+        load_checkpoint(path)
+    assert "--ckpt" in str(info.value) and "weights_only" not in str(info.value)
+    assert info.value.__cause__ is not None
+    if name.endswith(".onnx"):
+        assert "onnxruntime" in str(info.value)
+
+
+def test_load_checkpoint_truncated_file_and_missing_file(tmp_path):
+    model = build_model("Unet", ENCODER, encoder_weights=None)
+    path = save_checkpoint(tmp_path / "best.pt", model, model_config("Unet", ENCODER), [H, W], 1, {})
+    data = path.read_bytes()
+    broken = tmp_path / "broken.pt"
+    broken.write_bytes(data[: len(data) // 2])  # 复制中断的 checkpoint
+    with pytest.raises(ValueError, match="已损坏"):
+        load_checkpoint(broken)
+    with pytest.raises(FileNotFoundError):
+        load_checkpoint(tmp_path / "missing.pt")
